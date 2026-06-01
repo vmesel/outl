@@ -9,6 +9,8 @@
     "build": "vite build",
     "serve": "vite preview",
     "tauri": "tauri",
+    "desktop": "tauri dev --config src-tauri/tauri.desktop.conf.json",
+    "desktop:build": "tauri build --config src-tauri/tauri.desktop.conf.json",
     "ios": "tauri ios dev",
     "test": "vitest run",
     "test:watch": "vitest"

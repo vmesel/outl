@@ -46,7 +46,7 @@ use outl_core::storage::JsonlStorage;
 use outl_core::workspace::Workspace;
 
 use parking_lot::{Mutex, MutexGuard};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 use tracing::{info, warn};
 
@@ -528,16 +528,99 @@ fn load_or_create_actor(local_dir: &Path) -> std::io::Result<ActorId> {
     Ok(actor)
 }
 
+/// Environment variable that, when set to a non-empty path, overrides
+/// every other workspace-root source. Highest precedence so a desktop
+/// user can point a single launch at an arbitrary folder
+/// (`OUTL_WORKSPACE=/path bun run desktop`) without editing any file.
+const WORKSPACE_ENV: &str = "OUTL_WORKSPACE";
+
+/// Persisted config file living next to the `actor` file in the app's
+/// data dir. Hand-editable JSON; the only key we read today is
+/// `workspace_root`.
+const CONFIG_FILE: &str = "config.json";
+
+/// Desktop config. Everything is optional so a partial / future file
+/// still parses. `workspace_root`, when present and non-empty, names
+/// the folder outl treats as the source of truth.
+#[derive(Debug, Default, Deserialize)]
+struct AppConfig {
+    #[serde(default)]
+    workspace_root: Option<String>,
+}
+
+/// Expand a leading `~/` to `$HOME`. The config/env values are
+/// hand-written, so accepting `~/Notes/outl` is a small courtesy.
+/// Anything else is returned verbatim.
+fn expand_tilde(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// Read `workspace_root` from `<local_dir>/config.json`, if the file
+/// exists and names a non-empty path. Missing file, unreadable file,
+/// malformed JSON, or empty value all resolve to `None` so we fall
+/// through to the next source rather than failing the launch.
+fn config_workspace_root(local_dir: &Path) -> Option<PathBuf> {
+    let path = local_dir.join(CONFIG_FILE);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let cfg: AppConfig = serde_json::from_str(&raw)
+        .map_err(|e| warn!("ignoring malformed {}: {e}", path.display()))
+        .ok()?;
+    let root = cfg.workspace_root?;
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+    Some(expand_tilde(root))
+}
+
+/// Resolve the folder outl treats as the source of truth, in order of
+/// precedence:
+///
+/// 1. `OUTL_WORKSPACE` env var — a per-launch override.
+/// 2. `workspace_root` in `<local_dir>/config.json` — a persisted choice.
+/// 3. The iCloud Ubiquity Container's `Documents/` subdir (mobile + the
+///    desktop default when iCloud is available).
+/// 4. `<local_dir>/Documents/` — local fallback when iCloud is absent.
+///
+/// An explicit override (1 or 2) is used **verbatim**: the folder the
+/// user named is the workspace root, with no `Documents/` subdir
+/// appended. That subdir only exists to satisfy iCloud's
+/// sync-only-`Documents` rule, which doesn't apply to a folder the user
+/// picked themselves.
 fn resolve_storage_root(local_fallback: &Path) -> PathBuf {
+    if let Some(raw) = std::env::var_os(WORKSPACE_ENV) {
+        let raw = raw.to_string_lossy();
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            let root = expand_tilde(raw);
+            info!(
+                "using workspace root from {WORKSPACE_ENV}: {}",
+                root.display()
+            );
+            return root;
+        }
+    }
+    if let Some(root) = config_workspace_root(local_fallback) {
+        info!(
+            "using workspace root from {CONFIG_FILE}: {}",
+            root.display()
+        );
+        return root;
+    }
     if let Some(container) = icloud_path::resolve_container(ICLOUD_CONTAINER_ID) {
         info!("using iCloud container at {}", container.display());
-        container
+        workspace_root_in(&container)
     } else {
         warn!(
             "iCloud container unavailable, falling back to local {}",
             local_fallback.display()
         );
-        local_fallback.to_path_buf()
+        workspace_root_in(local_fallback)
     }
 }
 
@@ -621,15 +704,14 @@ pub fn run() {
             std::fs::create_dir_all(&local_dir)?;
 
             let actor = load_or_create_actor(&local_dir)?;
-            // `resolve_storage_root` returns the iCloud Ubiquity Container
-            // root (the device-local mount). The workspace lives in
-            // `Documents/` directly inside the container — the
-            // container itself is already the outl namespace, so
-            // there's no need for a second `outl/` folder. The TUI
-            // is expected to be pointed at this same path via
-            // `--path "<container>/Documents"`.
-            let container_root = resolve_storage_root(&local_dir);
-            let storage_root = workspace_root_in(&container_root);
+            // `resolve_storage_root` returns the final workspace root,
+            // honouring (in order) the `OUTL_WORKSPACE` env var, a
+            // `workspace_root` in `config.json`, the iCloud container's
+            // `Documents/`, or a local `Documents/` fallback. An
+            // explicit override is used verbatim; the iCloud/fallback
+            // branches already include the `Documents/` subdir. The TUI
+            // can be pointed at the same path via `--path`.
+            let storage_root = resolve_storage_root(&local_dir);
             std::fs::create_dir_all(&storage_root)?;
             let hlc = HlcGenerator::new(actor);
 
